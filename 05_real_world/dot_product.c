@@ -15,8 +15,10 @@
  *      convolutions, and nearly every numerical algorithm
  */
 #include <immintrin.h>
+#include <x86intrin.h>   /* __rdtsc, __rdtscp */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -167,19 +169,42 @@ static double now(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-typedef float (*dot_fn)(const float*, const float*, int);
+static inline uint64_t tsc_start(void) {
+    _mm_lfence();
+    return __rdtsc();
+}
 
-static double time_fn(dot_fn fn, const float *a, const float *b, int n) {
+static inline uint64_t tsc_end(void) {
+    unsigned int aux;
+    uint64_t t = __rdtscp(&aux);
+    _mm_lfence();
+    return t;
+}
+
+typedef float (*dot_fn)(const float*, const float*, int);
+typedef struct { double secs; double cycles; } bench_result_t;
+
+static bench_result_t time_fn(dot_fn fn, const float *a, const float *b, int n) {
     volatile float sink = 0;
-    double best = 1e18;
+    double   best_secs   = 1e18;
+    double   best_cycles = 1e18;
+
     for (int trial = 0; trial < 5; trial++) {
-        double t0 = now();
+        uint64_t c0 = tsc_start();
+        double   t0 = now();
         for (int r = 0; r < 100; r++) sink += fn(a, b, n);
-        double elapsed = (now() - t0) / 100;
-        if (elapsed < best) best = elapsed;
+        uint64_t c1 = tsc_end();
+        double   t1 = now();
+
+        double elapsed_secs   = (t1 - t0) / 100;
+        double elapsed_cycles = (double)(c1 - c0) / 100;
+        if (elapsed_secs < best_secs) {
+            best_secs   = elapsed_secs;
+            best_cycles = elapsed_cycles;
+        }
     }
     (void)sink;
-    return best;
+    return (bench_result_t){ best_secs, best_cycles };
 }
 
 int main(void) {
@@ -209,22 +234,24 @@ int main(void) {
     };
     int nimpls = sizeof(impls) / sizeof(impls[0]);
 
-    printf("%-28s  %8s  %8s  %6s  %s\n",
-           "Implementation", "ms", "GFLOPS", "Speedup", "Result");
-    printf("%-28s  %8s  %8s  %6s  %s\n",
-           "---", "---", "---", "---", "---");
+    printf("%-28s  %8s  %8s  %8s  %6s  %s\n",
+           "Implementation", "ms", "cy/elem", "GFLOPS", "Speedup", "Result");
+    printf("%-28s  %8s  %8s  %8s  %6s  %s\n",
+           "---", "---", "---", "---", "---", "---");
 
     double t_scalar = 0;
     for (int i = 0; i < nimpls; i++) {
         float result = impls[i].fn(a, b, n);
-        double t = time_fn(impls[i].fn, a, b, n);
-        double gflops = 2.0 * n / t / 1e9;
+        bench_result_t r = time_fn(impls[i].fn, a, b, n);
+        double gflops      = 2.0 * n / r.secs / 1e9;
+        double cy_per_elem = r.cycles / n;
 
-        if (i == 0) t_scalar = t;
+        if (i == 0) t_scalar = r.secs;
         float relerr = fabsf(result - ref) / (fabsf(ref) + 1e-30f);
 
-        printf("%-28s  %8.3f  %8.2f  %6.1fx  %.8f  (err %.1e)\n",
-               impls[i].name, t*1000, gflops, t_scalar/t, result, relerr);
+        printf("%-28s  %8.3f  %8.2f  %8.2f  %6.1fx  %.6f  (err %.1e)\n",
+               impls[i].name, r.secs*1000, cy_per_elem, gflops, t_scalar/r.secs,
+               result, relerr);
     }
 
     printf("\nNote: floating-point results differ slightly between implementations\n");

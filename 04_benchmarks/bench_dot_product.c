@@ -30,8 +30,10 @@
  *   GCC does this automatically for simple loops; explicit unrolling helps.
  */
 #include <immintrin.h>
+#include <x86intrin.h>   /* __rdtsc, __rdtscp */
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include <math.h>
@@ -43,27 +45,71 @@ static double now(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 
-/* Run 'code' REPS times; report best (minimum) time over TRIALS trials.
- * Minimum eliminates OS scheduling jitter; captures the "unobstructed" run. */
+/*
+ * RDTSC serialization pattern:
+ *
+ *   LFENCE prevents the CPU from issuing subsequent instructions until all
+ *   prior memory operations complete. Combined with RDTSC/RDTSCP it gives
+ *   a clean measurement window.
+ *
+ *   Before: LFENCE → RDTSC        (ensures prior work finishes first)
+ *   After:  RDTSCP → LFENCE       (RDTSCP waits for prior insns to retire;
+ *                                   LFENCE prevents subsequent insns from
+ *                                   issuing before RDTSCP reads the counter)
+ *
+ * Note: RDTSC counts TSC ticks, not core cycles. On modern x86 the TSC
+ * increments at a fixed rate equal to the nominal (base) CPU frequency,
+ * regardless of turbo or power-saving states. So cycles ≈ TSC × (core_freq /
+ * tsc_freq). For an unthrottled benchmark the approximation is close.
+ */
+static inline uint64_t tsc_start(void) {
+    _mm_lfence();
+    return __rdtsc();
+}
+
+static inline uint64_t tsc_end(void) {
+    unsigned int aux;
+    uint64_t t = __rdtscp(&aux);
+    _mm_lfence();
+    return t;
+}
+
+typedef struct { double secs; double cycles; } bench_result_t;
+
+/* Run 'fn' REPS times; report best (minimum) measurement over TRIALS trials.
+ * Taking the minimum eliminates OS scheduling jitter. */
 #define REPS 50
 #define TRIALS 5
 
-static double bench_fn(void (*fn)(const float*, const float*, int, float*),
-                        const float *a, const float *b, int n) {
+static bench_result_t bench_fn(void (*fn)(const float*, const float*, int, float*),
+                                const float *a, const float *b, int n) {
     volatile float sink = 0;
     float result;
-    double best = 1e18;
+    double best_secs   = 1e18;
+    double best_cycles = 1e18;
+
     for (int t = 0; t < TRIALS; t++) {
-        double t0 = now();
+        uint64_t c0 = tsc_start();
+        double   t0 = now();
+
         for (int r = 0; r < REPS; r++) {
             fn(a, b, n, &result);
             sink += result;
         }
-        double elapsed = (now() - t0) / REPS;
-        if (elapsed < best) best = elapsed;
+
+        uint64_t c1 = tsc_end();
+        double   t1 = now();
+
+        double elapsed_secs   = (t1 - t0) / REPS;
+        double elapsed_cycles = (double)(c1 - c0) / REPS;
+
+        if (elapsed_secs < best_secs) {
+            best_secs   = elapsed_secs;
+            best_cycles = elapsed_cycles;
+        }
     }
     (void)sink;
-    return best;
+    return (bench_result_t){ best_secs, best_cycles };
 }
 
 /* ── Implementation 1: Scalar ────────────────────────────────────────────── */
@@ -194,11 +240,12 @@ void dot_avx512_8acc(const float *a, const float *b, int n, float *out) {
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
-static void print_result(const char *name, double secs, int n, double scalar_secs) {
-    double gflops = 2.0 * n / secs / 1e9;  /* 2 ops per MAC (mul + add) */
-    double gb      = 2.0 * n * sizeof(float) / secs / 1e9;
-    printf("  %-35s %6.3f ms  %6.2f GFLOPS  %5.1f GB/s  %4.1fx\n",
-           name, secs * 1000, gflops, gb, scalar_secs / secs);
+static void print_result(const char *name, bench_result_t r, int n, double scalar_secs) {
+    double gflops      = 2.0 * n / r.secs / 1e9;  /* 2 ops per MAC */
+    double gb          = 2.0 * n * sizeof(float) / r.secs / 1e9;
+    double cy_per_elem = r.cycles / n;
+    printf("  %-35s %6.3f ms  %5.2f cy/e  %6.2f GFLOPS  %5.1f GB/s  %4.1fx\n",
+           name, r.secs * 1000, cy_per_elem, gflops, gb, scalar_secs / r.secs);
 }
 
 int main(void) {
@@ -227,39 +274,39 @@ int main(void) {
         }
 
         printf("=== %s: N=%d floats ===\n", size_names[si], n);
-        printf("  %-35s %8s  %12s  %10s  %5s\n",
-               "Implementation", "Time", "GFLOPS", "Bandwidth", "Speedup");
+        printf("  %-35s %8s  %8s  %12s  %10s  %5s\n",
+               "Implementation", "Time", "cy/elem", "GFLOPS", "Bandwidth", "Speedup");
 
-        double t_scalar = bench_fn(dot_scalar,      a, b, n);
-        print_result("scalar (1 acc)",         t_scalar, n, t_scalar);
+        bench_result_t r_scalar = bench_fn(dot_scalar,      a, b, n);
+        print_result("scalar (1 acc)",         r_scalar, n, r_scalar.secs);
 
-        double t_s4 = bench_fn(dot_scalar_4acc, a, b, n);
-        print_result("scalar (4 acc)",         t_s4,     n, t_scalar);
+        bench_result_t r_s4    = bench_fn(dot_scalar_4acc, a, b, n);
+        print_result("scalar (4 acc)",         r_s4,    n, r_scalar.secs);
 
-        double t_sse = bench_fn(dot_sse,         a, b, n);
-        print_result("SSE    (4-wide, 2 acc)", t_sse,    n, t_scalar);
+        bench_result_t r_sse   = bench_fn(dot_sse,         a, b, n);
+        print_result("SSE    (4-wide, 2 acc)", r_sse,   n, r_scalar.secs);
 
-        double t_avx1 = bench_fn(dot_avx_1acc,  a, b, n);
-        print_result("AVX2   (8-wide, 1 acc)", t_avx1,  n, t_scalar);
+        bench_result_t r_avx1  = bench_fn(dot_avx_1acc,   a, b, n);
+        print_result("AVX2   (8-wide, 1 acc)", r_avx1,  n, r_scalar.secs);
 
-        double t_avx8 = bench_fn(dot_avx_8acc,  a, b, n);
-        print_result("AVX2   (8-wide, 8 acc)", t_avx8,  n, t_scalar);
+        bench_result_t r_avx8  = bench_fn(dot_avx_8acc,   a, b, n);
+        print_result("AVX2   (8-wide, 8 acc)", r_avx8,  n, r_scalar.secs);
 
-        double t_512 = bench_fn(dot_avx512_8acc, a, b, n);
-        print_result("AVX-512(16-wide,8 acc)", t_512,   n, t_scalar);
+        bench_result_t r_512   = bench_fn(dot_avx512_8acc, a, b, n);
+        print_result("AVX-512(16-wide,8 acc)", r_512,   n, r_scalar.secs);
 
         printf("\n");
 
         /* Correctness check */
-        float r_scalar, r_avx8, r_512;
-        dot_scalar(a, b, n, &r_scalar);
-        dot_avx_8acc(a, b, n, &r_avx8);
-        dot_avx512_8acc(a, b, n, &r_512);
+        float c_scalar, c_avx8, c_512;
+        dot_scalar(a, b, n, &c_scalar);
+        dot_avx_8acc(a, b, n, &c_avx8);
+        dot_avx512_8acc(a, b, n, &c_512);
 
-        float rel_avx8 = fabsf(r_avx8 - r_scalar) / fabsf(r_scalar + 1e-30f);
-        float rel_512  = fabsf(r_512  - r_scalar) / fabsf(r_scalar + 1e-30f);
+        float rel_avx8 = fabsf(c_avx8 - c_scalar) / fabsf(c_scalar + 1e-30f);
+        float rel_512  = fabsf(c_512  - c_scalar) / fabsf(c_scalar + 1e-30f);
         printf("  Correctness: scalar=%.6g avx8=%.6g (err=%.2e) avx512=%.6g (err=%.2e)\n\n",
-               r_scalar, r_avx8, rel_avx8, r_512, rel_512);
+               c_scalar, c_avx8, rel_avx8, c_512, rel_512);
 
         free(a); free(b);
     }
